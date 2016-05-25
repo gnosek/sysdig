@@ -26,6 +26,9 @@ along with sysdig.  If not, see <http://www.gnu.org/licenses/>.
 #include <sys/stat.h>
 #include <assert.h>
 #include <algorithm>
+#ifdef HAS_FILTERING
+#include <sys/wait.h>
+#endif
 
 #include <sinsp.h>
 #include "chisel.h"
@@ -70,6 +73,15 @@ static void usage()
 " -b, --print-base64 Print data buffers in base64. This is useful for encoding\n"
 "                    binary data that needs to be used over media designed to\n"
 "                    handle textual data (i.e., terminal or json).\n"
+#ifdef HAS_FILTERING
+" --exec <command>   Execute and trace the specified shell command\n"
+"                    With this option, sysdig spawns the specified command,\n"
+"                    sets an additional filter to trace only the command\n"
+"                    (including any subprocesses it may spawn) and exits\n"
+"                    as soon as the command and all its subprocesses exit\n"
+"                    (comparable to strace -ff command). If the command\n"
+"                    needs arguments, use quotes, e.g. --exec \"ls /etc\".\n"
+#endif
 #ifdef HAS_CHISELS
 " -c <chiselname> <chiselargs>, --chisel  <chiselname> <chiselargs>\n"
 "                    run the specified chisel. If the chisel require arguments,\n"
@@ -517,7 +529,8 @@ captureinfo do_inspect(sinsp* inspector,
 	bool print_progress,
 	sinsp_filter* display_filter,
 	vector<summary_table_entry>* summary_table,
-	sinsp_evt_formatter* formatter)
+	sinsp_evt_formatter* formatter,
+	bool trace_pids)
 {
 	captureinfo retval;
 	int32_t res;
@@ -525,6 +538,9 @@ captureinfo do_inspect(sinsp* inspector,
 	string line;
 	double last_printed_progress_pct = 0;
 	int duration_start = 0;
+#ifdef HAS_FILTERING
+	set<pid_t> pids;
+#endif
 
 	if(json)
 	{
@@ -685,6 +701,27 @@ captureinfo do_inspect(sinsp* inspector,
 		{
 			cout << flush;
 		}
+
+#ifdef HAS_FILTERING
+		if(trace_pids)
+		{
+			uint16_t etype = ev->get_type();
+			pid_t tid = ev->get_tid();
+
+			if(etype == PPME_PROCEXIT_E || etype == PPME_PROCEXIT_1_E)
+			{
+				pids.erase(tid);
+				if (pids.empty())
+				{
+					g_terminate = true;
+				}
+			}
+			else
+			{
+				pids.insert(tid);
+			}
+		}
+#endif
 	}
 
 	return retval;
@@ -727,6 +764,10 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 	string* k8s_api_cert = 0;
 	string* mesos_api = 0;
 	bool force_tracers_capture = false;
+#ifdef HAS_FILTERING
+	string command;
+	pid_t command_pid = 0;
+#endif
 
 	// These variables are for the cycle_writer engine
 	int duration_seconds = 0;
@@ -778,6 +819,9 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 		{"print-hex", no_argument, 0, 'x'},
 		{"print-hex-ascii", no_argument, 0, 'X'},
 		{"compress", no_argument, 0, 'z' },
+#ifdef HAS_FILTERING
+		{"exec", required_argument, 0, 1 },
+#endif
 		{0, 0, 0, 0}
 	};
 
@@ -1123,6 +1167,11 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 			case 'z':
 				compress = true;
 				break;
+#ifdef HAS_FILTERING
+			case 1:
+				command = optarg;
+				break;
+#endif
             // getopt_long : '?' for an ambiguous match or an extraneous parameter 
 			case '?':
 				delete inspector;
@@ -1225,11 +1274,6 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 				}
 			}
 
-			if(is_filter_display)
-			{
-				sinsp_filter_compiler compiler(inspector, filter);
-				display_filter = compiler.compile();
-			}
 #else
 			fprintf(stderr, "filtering not compiled.\n");
 			res.m_res = EXIT_FAILURE;
@@ -1237,6 +1281,54 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 #endif
 		}
 
+#ifdef HAS_FILTERING
+		if (command.size()) {
+			if(infiles.size() != 0)
+			{
+				fprintf(stderr, "the --exec flag cannot be used with saved captures.\n");
+				res.m_res = EXIT_FAILURE;
+				goto exit;
+			}
+
+			if(signal(SIGCHLD, SIG_IGN) == SIG_ERR)
+			{
+				fprintf(stderr, "An error occurred while setting SIGCHLD signal handler.\n");
+				res.m_res = EXIT_FAILURE;
+				goto exit;
+			}
+
+			command_pid = fork();
+			switch(command_pid) {
+				case 0: // child
+					raise(SIGSTOP);
+					execl("/bin/sh", "/bin/sh", "-c", command.c_str(), 0);
+					perror("Failed to exec process");
+					_exit(255);
+				case -1: // fork error
+					perror("Failed to fork --exec process");
+					res.m_res = EXIT_FAILURE;
+					goto exit;
+				default:
+					char pid_filter[sizeof("proc.apid = 18446744073709551616")];
+					snprintf(pid_filter, sizeof(pid_filter), "proc.apid = %d", command_pid);
+					if (filter.size())
+					{
+						filter = "((" + filter + ") or evt.type=procexit) and (" + pid_filter + ")";
+					}
+					else
+					{
+						filter = pid_filter;
+					}
+			}
+		}
+
+		if(is_filter_display)
+		{
+			sinsp_filter_compiler compiler(inspector, filter);
+			display_filter = compiler.compile();
+		}
+
+#endif
 		if(signal(SIGINT, signal_callback) == SIG_ERR)
 		{
 			fprintf(stderr, "An error occurred while setting SIGINT signal handler.\n");
@@ -1455,6 +1547,11 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 			delete mesos_api;
 			mesos_api = 0;
 
+			if (command_pid > 0)
+			{
+				kill(command_pid, SIGCONT);
+			}
+
 			cinfo = do_inspect(inspector,
 				cnt,
 				duration_to_tot,
@@ -1464,7 +1561,8 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 				print_progress,
 				display_filter,
 				summary_table,
-				&formatter);
+				&formatter,
+				command_pid != 0);
 
 			duration = ((double)clock()) / CLOCKS_PER_SEC - duration;
 
